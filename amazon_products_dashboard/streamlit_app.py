@@ -1,5 +1,5 @@
 # Kane Williams 2024-Dec-15 --- An Amazon Product Analysis
-# As part of a 2 hour "Data Test" for a "Data Analyst" position at "Frankies".
+# As part of a 2 hour "Data Test" for a "Data Analyst" position at "Frankie".
 # For more please view my Github: https://github.com/kanewilliams
 
 import streamlit as st
