@@ -58,22 +58,21 @@ def create_gantt_chart(df):
         'Remuera': '#ff7f0e'
     }
     
-    # Function to adjust end time for very short outages to ensure visibility
-    def adjust_duration(start, end):
-        duration = (end - start).total_seconds() / 3600  # duration in hours
-        if duration < 24:  # if less than 24 hours
-            return start + pd.Timedelta(hours=24)
-        return end
+    # Function to calculate end time based on duration_minutes
+    def get_visible_duration(duration_minutes):
+        # Convert to milliseconds, ensure minimum visibility of 24 hours
+        duration_ms = duration_minutes * 60 * 1000  # Convert minutes to milliseconds
+        min_duration_ms = 24 * 60 * 60 * 1000  # 24 hours in milliseconds
+        return max(duration_ms, min_duration_ms)
     
     for idx, row in df.iterrows():
-        # Adjust end time for visibility of short outages
-        visible_end = adjust_duration(row['start_time'], row['end_time'])
+        duration_ms = get_visible_duration(row['duration_minutes'])
         
         fig.add_trace(go.Bar(
-            base=row['start_time'],  # Start time of the bar
-            x=[(visible_end - row['start_time']).total_seconds() * 1000],  # Duration in milliseconds
+            base=row['start_time'],
+            x=[duration_ms],  # Use duration in milliseconds
             y=[row['transformer_name']],
-            orientation='h',  # Make the bars horizontal
+            orientation='h',
             marker_color=colors[row['suburb']],
             name=row['suburb'],
             text=f"{row['suburb']}",
@@ -81,7 +80,6 @@ def create_gantt_chart(df):
                 f"Transformer: {row['transformer_name']}<br>" +
                 f"Suburb: {row['suburb']}<br>" +
                 f"Start: {row['start_time'].strftime('%Y-%m-%d %H:%M')}<br>" +
-                f"End: {row['end_time'].strftime('%Y-%m-%d %H:%M')}<br>" +
                 f"Duration: {row['duration_minutes']} mins<br>" +
                 f"Customers: {row['customers_on_transformer']:,}<br>" +
                 f"Status: {row['status']}<br>" +
@@ -91,7 +89,7 @@ def create_gantt_chart(df):
         ))
     
     min_time = df['start_time'].min() - pd.Timedelta(days=1)
-    max_time = df['end_time'].max() + pd.Timedelta(days=1)
+    max_time = df['start_time'].max() + pd.Timedelta(days=30)  # Extended to show full duration bars
     
     fig.update_layout(
         title="Outage Timeline by Transformer",
@@ -118,17 +116,31 @@ def create_gantt_chart(df):
 def main():
     st.title("Electricity Outage Dashboard")
     
-    # Load data
     df = load_data()
+    
+    # Calculate suburb-level durations and compare with limits
+    suburb_durations = df.groupby('suburb').agg({
+        'duration_minutes': 'sum',
+        'duration_limit': 'first'
+    }).reset_index()
+    suburb_durations['limit_exceeded'] = suburb_durations['duration_minutes'] > suburb_durations['duration_limit']
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Outages", len(df['outage_id'].unique()))
+    with col2:
+        st.metric("Open Outages", len(df[df['status'] == 'Open']))
+    with col3:
+        total_customers = df['customers_on_transformer'].sum()
+        st.metric("Total Customers Affected", f"{total_customers:,}")
     
     # Sidebar filters
     st.sidebar.header("Filters")
     
-    # Suburb filter
+    show_exceeded_only = st.sidebar.checkbox("Show Only Suburbs Exceeding Duration Limits")
     suburbs = ['All'] + sorted(df['suburb'].unique().tolist())
     selected_suburb = st.sidebar.selectbox("Select Suburb", suburbs)
     
-    # Date range filter
     min_date = df['start_time'].min().date()
     max_date = df['start_time'].max().date()
     date_range = st.sidebar.date_input(
@@ -140,6 +152,9 @@ def main():
     
     # Filter data based on selections
     filtered_df = df.copy()
+    if show_exceeded_only:
+        exceeded_suburbs = suburb_durations[suburb_durations['limit_exceeded']]['suburb'].tolist()
+        filtered_df = filtered_df[filtered_df['suburb'].isin(exceeded_suburbs)]
     if selected_suburb != 'All':
         filtered_df = filtered_df[filtered_df['suburb'] == selected_suburb]
     if len(date_range) == 2:
@@ -148,20 +163,6 @@ def main():
             (filtered_df['start_time'].dt.date <= date_range[1])
         ]
     
-    # Calculate metrics
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("All Outages", len(filtered_df['outage_id'].unique()))
-    with col2:
-        st.metric("Open Outages", len(filtered_df[filtered_df['status'] == 'Open']))
-    with col3:
-        total_customers = filtered_df['customers_on_transformer'].sum()
-        st.metric("Total Customers Affected (Possible Duplicates)", f"{total_customers:,}")
-    
-    # Display Gantt chart
-    st.plotly_chart(create_gantt_chart(filtered_df), use_container_width=True)
-    
-    # Create two columns for additional charts
     col_left, col_right = st.columns(2)
     
     with col_left:
@@ -171,29 +172,78 @@ def main():
             'duration_limit': 'first'
         }).reset_index()
         
-        fig = go.Figure(data=[
-            go.Bar(name='Total Outage Time', x=suburb_durations['suburb'], 
-                  y=suburb_durations['duration_minutes']),
-            go.Bar(name='Duration Limit', x=suburb_durations['suburb'], 
-                  y=suburb_durations['duration_limit'])
-        ])
-        fig.update_layout(barmode='group')
-        st.plotly_chart(fig, use_container_width=True)
-    
+        fig_limits = go.Figure()
+        
+        fig_limits.add_trace(go.Bar(
+            name='Total Outage Time',
+            x=suburb_durations['suburb'],
+            y=suburb_durations['duration_minutes'],
+            marker_color=['red' if d > l else 'green' for d, l in 
+                         zip(suburb_durations['duration_minutes'], suburb_durations['duration_limit'])],
+        ))
+        
+        fig_limits.add_trace(go.Bar(
+            name='Duration Limit',
+            x=suburb_durations['suburb'],
+            y=suburb_durations['duration_limit'],
+            marker_color='black',
+        ))
+        
+        fig_limits.update_layout(
+            barmode='group',
+            yaxis_title="Minutes",
+            height=400
+        )
+        
+        st.plotly_chart(fig_limits, use_container_width=True)
+
     with col_right:
         st.subheader("Customers Affected by Suburb")
         customers_by_suburb = filtered_df.groupby('suburb')['customers_on_transformer'].sum()
-        fig_pie = px.pie(values=customers_by_suburb.values, names=customers_by_suburb.index)
+        
+        colors = {
+            'Ponsonby': '#1f77b4',    # medium blue
+            'Albany': '#7aa6c2',      # light blue
+            'Remuera': '#084081'      # dark blue
+        }
+        
+        color_list = [colors[suburb] for suburb in customers_by_suburb.index]
+        
+        fig_pie = px.pie(
+            values=customers_by_suburb.values, 
+            names=customers_by_suburb.index,
+            color_discrete_sequence=color_list
+        )
+        fig_pie.update_layout(height=400)
         st.plotly_chart(fig_pie, use_container_width=True)
+    
+    # Warning message for exceeded limits
+    exceeded_suburbs = suburb_durations[
+        suburb_durations['duration_minutes'] > suburb_durations['duration_limit']
+    ]['suburb'].tolist()
+    
+    if exceeded_suburbs:
+        st.warning(f"Duration limits exceeded in: {', '.join(exceeded_suburbs)}")
+    
+    # Timeline visualization
+    st.subheader("Outage Timeline by Transformer")
+    st.plotly_chart(create_gantt_chart(filtered_df), use_container_width=True)
     
     # Detailed data view
     st.subheader("Detailed Outage Data")
-    display_df = filtered_df.drop('duration_limit', axis=1)
-    st.dataframe(display_df.style.format({
+    display_df = filtered_df.copy()
+    display_df['Duration Limit Exceeded'] = display_df.apply(
+        lambda x: 'YES' if x['duration_minutes'] > x['duration_limit'] else 'No', 
+        axis=1
+    )
+    display_cols = ['outage_id', 'suburb', 'transformer_name', 'customers_on_transformer', 
+                    'start_time', 'duration_minutes', 'duration_limit', 'Duration Limit Exceeded', 'status']
+    
+    st.dataframe(display_df[display_cols].style.format({
         'customers_on_transformer': '{:,}'.format,
         'duration_minutes': '{:,.0f}'.format,
+        'duration_limit': '{:,.0f}'.format,
         'start_time': lambda x: x.strftime('%Y-%m-%d %H:%M'),
-        'end_time': lambda x: x.strftime('%Y-%m-%d %H:%M') if pd.notna(x) else 'Ongoing'
     }))
 
 if __name__ == "__main__":
